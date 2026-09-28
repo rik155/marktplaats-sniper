@@ -51,15 +51,22 @@ TELEGRAM_CHAT_ID=jouw_chat_id
 
 ## Marktplaats
 
-Zet een geldige API-token in:
+De sniper werkt standaard via de openbare zoekresultaten van Marktplaats. Er is
+dus geen API-token nodig. Houd het scaninterval op minimaal 60 seconden om de
+site niet onnodig te belasten.
+
+Heb je later toch een geldige officiële API-token, dan kun je die optioneel invullen:
 
 ```env
 MARKTPLAATS_ACCESS_TOKEN=
 ```
 
-De app gebruikt standaard:
+Met een token gebruikt de app eerst:
 
 `https://api.marktplaats.nl/v2/search`
+
+Als die API niet beschikbaar is, valt de app automatisch terug op de openbare
+zoekpagina.
 
 ## Docker
 
