@@ -299,7 +299,13 @@ async def scan_sniper(sniper):
             )
 
         if fresh:
-            log_event(sniper["id"], "info", f"{len(fresh)} nieuwe advertentie(s) gevonden")
+            log_event(sniper["id"], "info", f"Scan klaar: {len(fresh)} nieuwe advertentie(s) gevonden")
+        else:
+            log_event(
+                sniper["id"],
+                "info",
+                f"Scan klaar: {len(ads)} advertentie(s) gecontroleerd, niets nieuws gevonden",
+            )
 
     except Exception as exc:
         log_event(sniper["id"], "error", f"Scanfout: {type(exc).__name__}: {exc}")
