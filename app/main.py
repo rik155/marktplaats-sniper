@@ -1,9 +1,10 @@
+import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,8 +16,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 DB_PATH = BASE_DIR / os.getenv("DATABASE_PATH", "sniper.db")
-SCAN_INTERVAL = max(15, int(os.getenv("SCAN_INTERVAL_SECONDS", "60")))
+SCAN_INTERVAL = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "60")))
 API_BASE = os.getenv("MARKTPLAATS_API_BASE", "https://api.marktplaats.nl").rstrip("/")
+PUBLIC_BASE = "https://www.marktplaats.nl"
 ACCESS_TOKEN = os.getenv("MARKTPLAATS_ACCESS_TOKEN", "").strip()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -94,6 +96,9 @@ def normalize_ad(raw):
     )
     title = str(raw.get("title") or raw.get("description") or "Marktplaats advertentie").strip()
     price = raw.get("price")
+    if price is None and isinstance(raw.get("priceInfo"), dict):
+        cents = raw["priceInfo"].get("priceCents")
+        price = cents / 100 if isinstance(cents, (int, float)) else None
     if isinstance(price, dict):
         price = price.get("amount") or price.get("cents")
         if isinstance(price, (int, float)) and price > 10000:
@@ -111,7 +116,9 @@ def normalize_ad(raw):
     url = raw.get("url") or raw.get("vipUrl") or raw.get("link") or ""
     if isinstance(url, dict):
         url = url.get("href") or ""
-    if not url and ad_id:
+    if url:
+        url = urljoin(PUBLIC_BASE, url)
+    elif ad_id:
         url = f"https://www.marktplaats.nl/q/{quote_plus(title)}/"
 
     return {
@@ -120,10 +127,16 @@ def normalize_ad(raw):
         "price": price,
         "location": location,
         "url": url,
+        "has_images": bool(raw.get("imageUrls") or raw.get("pictures") or raw.get("images")),
+        "distance_meters": (
+            raw.get("location", {}).get("distanceMeters")
+            if isinstance(raw.get("location"), dict)
+            else None
+        ),
     }
 
 
-async def search_marktplaats(sniper):
+async def search_official_api(sniper):
     params = {"query": sniper["query"], "offset": 0, "limit": 30}
     if sniper["only_with_images"]:
         params["withImages"] = "true"
@@ -136,14 +149,81 @@ async def search_marktplaats(sniper):
     if sniper["distance_km"]:
         params["filters.distance"] = sniper["distance_km"] * 1000
 
-    headers = {"Accept": "application/json"}
-    if ACCESS_TOKEN:
-        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
 
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         response = await client.get(f"{API_BASE}/v2/search", params=params, headers=headers)
         response.raise_for_status()
         return [normalize_ad(x) for x in extract_results(response.json())]
+
+
+def extract_public_listings(html):
+    marker = '<script id="__NEXT_DATA__"'
+    start = html.find(marker)
+    if start < 0:
+        raise ValueError("Marktplaats-resultaten konden niet worden gelezen")
+    start = html.find(">", start) + 1
+    end = html.find("</script>", start)
+    if start == 0 or end < 0:
+        raise ValueError("Marktplaats-resultaten zijn onvolledig")
+
+    payload = json.loads(html[start:end])
+    return (
+        payload.get("props", {})
+        .get("pageProps", {})
+        .get("searchRequestAndResponse", {})
+        .get("listings", [])
+    )
+
+
+async def search_public_page(sniper):
+    params = {"sortBy": "SORT_INDEX", "sortOrder": "DECREASING"}
+    if sniper["min_price"] is not None:
+        params["Pricefrom"] = sniper["min_price"]
+    if sniper["max_price"] is not None:
+        params["Priceto"] = sniper["max_price"]
+    if sniper["postcode"]:
+        params["postcode"] = sniper["postcode"].replace(" ", "").upper()
+    if sniper["distance_km"]:
+        params["distanceMeters"] = sniper["distance_km"] * 1000
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "nl-NL,nl;q=0.9",
+        "User-Agent": "Mozilla/5.0 (compatible; MarktplaatsSniper/1.0; persoonlijk gebruik)",
+    }
+    url = f"{PUBLIC_BASE}/q/{quote_plus(sniper['query'])}/"
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        response = await client.get(url, params=params, headers=headers)
+        if response.status_code == 429:
+            raise RuntimeError("Marktplaats vraagt om rustiger te scannen; probeer later opnieuw")
+        response.raise_for_status()
+        ads = [normalize_ad(x) for x in extract_public_listings(response.text)]
+
+    filtered = []
+    for ad in ads:
+        price = ad["price"]
+        if sniper["only_with_images"] and not ad["has_images"]:
+            continue
+        if sniper["min_price"] is not None and isinstance(price, (int, float)) and price < sniper["min_price"]:
+            continue
+        if sniper["max_price"] is not None and isinstance(price, (int, float)) and price > sniper["max_price"]:
+            continue
+        distance = ad["distance_meters"]
+        if sniper["distance_km"] and isinstance(distance, (int, float)) and distance >= 0:
+            if distance > sniper["distance_km"] * 1000:
+                continue
+        filtered.append(ad)
+    return filtered
+
+
+async def search_marktplaats(sniper):
+    if ACCESS_TOKEN:
+        try:
+            return await search_official_api(sniper)
+        except (httpx.HTTPError, ValueError):
+            log_event(sniper["id"], "info", "API niet beschikbaar; openbare zoekpagina gebruikt")
+    return await search_public_page(sniper)
 
 
 async def send_telegram(ad, sniper):
@@ -335,8 +415,8 @@ ul{{padding-left:20px}}
       <h2>Status</h2>
       <p>Scaninterval: <b>{SCAN_INTERVAL} seconden</b></p>
       <p>Telegram: <b>{'ingesteld' if BOT_TOKEN and CHAT_ID else 'nog niet ingesteld'}</b></p>
-      <p>Marktplaats token: <b>{'ingesteld' if ACCESS_TOKEN else 'nog niet ingesteld'}</b></p>
-      <p>De app blijft werken als dashboard zonder token, maar scans kunnen dan een API-fout geven.</p>
+      <p>Gegevensbron: <b>{'officiële API met openbare zoekpagina als reserve' if ACCESS_TOKEN else 'openbare Marktplaats-zoekpagina'}</b></p>
+      <p>Voor zoeken is geen Marktplaats-token nodig.</p>
     </div>
   </div>
 
